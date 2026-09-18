@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>GridWise LLM Dashboard</title>
+    <style>
+        body { font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #f4f7f6; color: #333; }
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        button { background: #0070f3; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        button:hover { background: #0051a2; }
+        pre { background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 6px; overflow-x: auto; max-height: 400px; }
+        .badge { display: inline-block; padding: 4px 8px; font-size: 12px; font-weight: bold; border-radius: 4px; background: #e0e0e0; }
+        .online { background: #d4edda; color: #155724; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>⚡ GridWise LLM Dashboard</h2>
+        <p>API Status: <span id="status" class="badge">Checking...</span></p>
+        <button onclick="runOptimization()">Run Test Optimization</button>
+    </div>
+
+    <div class="card">
+        <h3>Output Result JSON</h3>
+        <pre id="output">Click 'Run Test Optimization' to test backend pipeline...</pre>
+    </div>
+
+    <script>
+        async function checkHealth() {
+            try {
+                const res = await fetch('/health');
+                const data = await res.json();
+                document.getElementById('status').innerText = data.status.toUpperCase();
+                document.getElementById('status').classList.add('online');
+            } catch (e) {
+                document.getElementById('status').innerText = 'OFFLINE';
+            }
+        }
+        checkHealth();
+
+        async function runOptimization() {
+            document.getElementById('output').innerText = "Processing via OpenRouter LLM + Optimizer...";
+
+            // Build mock 24 hour template
+            const hoursTemplate = Array.from({length: 24}, (_, i) => ({
+                hour: i,
+                demand_kwh: 100 + Math.sin(i / 3) * 40,
+                solar_kwh: (i >= 6 && i <= 18) ? Math.max(0, 120 * Math.sin((i - 6) * Math.PI / 12)) : 0,
+                tariff_bdt_per_kwh: (i >= 17 && i <= 21) ? 12 : 6
+            }));
+
+            const payload = {
+                scenario_id: "GRID-SOLO-101",
+                operator_notes: [
+                    "Solar output drops to 20% during hours 13 and 14 due to clouds.",
+                    "Do not charge the battery between 18 and 20 hours."
+                ],
+                hours: hoursTemplate,
+                battery: {
+                    capacity_kwh: 400,
+                    initial_energy_kwh: 150,
+                    minimum_energy_kwh: 50,
+                    max_charge_kwh_per_hour: 80,
+                    max_discharge_kwh_per_hour: 80
+                }
+            };
+
+            try {
+                const res = await fetch('/optimize-energy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                document.getElementById('output').innerText = JSON.stringify(data, null, 2);
+            } catch (e) {
+                document.getElementById('output').innerText = "Error: " + e.message;
+            }
+        }
+    </script>
+</body>
+</html>
