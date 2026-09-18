@@ -1,34 +1,25 @@
-# GridWise LLM Energy Optimizer
+# ⚡ GridWise LLM — BUP CSE Fest 2026
 
-An enterprise-grade, full-stack decision support and optimization pipeline built for the **BUP CSE Fest 2026 GridWise-LLM Challenge**. It combines OpenRouter LLM interpretation, strict deterministic guardrails, a true 24-hour constrained cost optimizer, and an independent replay verification validator.
+An enterprise-grade, deterministic-backed full-stack energy optimization engine that interprets natural language operator notes using an LLM, applies rigid safety guardrails, and solves 24-hour grid schedules using JavaScript.
 
----
+## 🛠️ Architecture Pipeline
+1. **Natural Language Input** (Operator notes)
+2. **LLM Interpretation** (OpenRouter AI structured extraction)
+3. **Deterministic Guardrails** (Schema, hour mapping, and factor validation)
+4. **Mathematical Optimizer** (Dynamic energy balancing & battery constraint resolution)
+5. **Replay Validation & Response**
 
-## Architecture Pipeline
+## 🚀 API Endpoints
+- `GET /health` — Returns service readiness status (`{"status": "ok"}`).
+- `POST /optimize-energy` — Accepts scenario payload, evaluates notes, and returns the optimized 24-hour schedule and total cost in BDT.
 
-1. **Natural Language Input**: Operator notes are accepted via `POST /optimize-energy`.
-2. **LLM Interpretation**: OpenRouter API extracts structured JSON operational directives.
-3. **Deterministic Guardrails**: Validates schema compliance, numeric bounds, and rejects malformed outputs without silent conversions.
-4. **Constrained Cost Optimizer**: Dynamic programming state-space solver minimizes total daily grid cost ($\sum \text{grid} \times \text{tariff}$) while enforcing hard battery reserves, charge/discharge caps, and exact end-of-day battery neutrality.
-5. **Replay Validator**: Independently replays every hour of the optimized schedule to verify energy balance, solar caps, and window constraints.
+## 💻 Local Setup & Testing
+```bash
+# Install dependencies
+npm install
 
----
+# Run test suite
+npm test
 
-## Endpoints
-
-### `GET /health`
-Returns service readiness status.
-* **Response**: `{"status": "ok"}`
-
-### `POST /optimize-energy`
-Accepts a 24-hour scenario payload and operator notes, returning an optimized energy schedule and total cost in BDT.
-
----
-
-## Environment Variables
-
-Create a `.env` file in the root directory:
-```env
-PORT=3000
-OPENROUTER_API_KEY=your_openrouter_api_key_here
-LLM_MODEL=openrouter/free
+# Start server
+npm start
