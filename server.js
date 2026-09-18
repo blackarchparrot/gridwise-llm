@@ -12,66 +12,85 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ==========================================
+// 1. HEALTH ENDPOINT
+// ==========================================
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
 // ==========================================
-// 1. RIGID REQUEST & SCHEMA VALIDATION
+// 2. STRICT REQUEST VALIDATION
 // ==========================================
 function validateRequestPayload(body) {
   if (!body || typeof body !== 'object') return "Invalid JSON payload.";
-  if (!body.scenario_id || typeof body.scenario_id !== 'string') return "Missing or invalid scenario_id.";
-  if (!Array.isArray(body.operator_notes) || body.operator_notes.length === 0 || body.operator_notes.length > 5) {
-    return "operator_notes must be a non-empty array of 1 to 5 strings.";
+  if (typeof body.scenario_id !== 'string' || !body.scenario_id.trim()) return "Missing or invalid 'scenario_id'.";
+
+  // Operator notes: exactly 1–3 non-empty strings
+  if (!Array.isArray(body.operator_notes) || body.operator_notes.length < 1 || body.operator_notes.length > 3) {
+    return "'operator_notes' must contain between 1 and 3 items.";
   }
+  for (const note of body.operator_notes) {
+    if (typeof note !== 'string' || !note.trim()) return "All operator notes must be non-empty strings.";
+  }
+
+  // Hours: exactly 24 records
   if (!Array.isArray(body.hours) || body.hours.length !== 24) {
-    return "hours must be an array of exactly 24 hourly objects.";
+    return "'hours' array must contain exactly 24 hourly entries.";
   }
+
   for (let i = 0; i < 24; i++) {
     const h = body.hours[i];
-    if (!h || h.hour !== i || typeof h.demand_kwh !== 'number' || typeof h.solar_kwh !== 'number' || typeof h.tariff_bdt_per_kwh !== 'number') {
-      return `Invalid hourly structure at index ${i}.`;
-    }
+    if (!h || typeof h !== 'object') return `Hour ${i}: Invalid entry object.`;
+    if (typeof h.demand_kwh !== 'number' || Number.isNaN(h.demand_kwh) || h.demand_kwh < 0) return `Hour ${i}: Invalid demand_kwh.`;
+    if (typeof h.solar_kwh !== 'number' || Number.isNaN(h.solar_kwh) || h.solar_kwh < 0) return `Hour ${i}: Invalid solar_kwh.`;
+    if (typeof h.tariff_bdt_per_kwh !== 'number' || Number.isNaN(h.tariff_bdt_per_kwh) || h.tariff_bdt_per_kwh < 0) return `Hour ${i}: Invalid tariff_bdt_per_kwh.`;
   }
-  const bat = body.battery;
-  if (!bat || typeof bat.capacity_kwh !== 'number' || typeof bat.initial_energy_kwh !== 'number' || typeof bat.minimum_energy_kwh !== 'number' || typeof bat.max_charge_kwh_per_hour !== 'number' || typeof bat.max_discharge_kwh_per_hour !== 'number') {
-    return "Invalid or incomplete battery parameters.";
-  }
-  if (bat.initial_energy_kwh < bat.minimum_energy_kwh || bat.initial_energy_kwh > bat.capacity_kwh) {
-    return "initial_energy_kwh must be between minimum_energy_kwh and capacity_kwh.";
-  }
+
+  // Battery schema check
+  const b = body.battery;
+  if (!b || typeof b !== 'object') return "Missing 'battery' configuration object.";
+  if (typeof b.capacity_kwh !== 'number' || b.capacity_kwh <= 0) return "Invalid battery capacity.";
+  if (typeof b.initial_energy_kwh !== 'number' || b.initial_energy_kwh < 0 || b.initial_energy_kwh > b.capacity_kwh) return "Invalid initial battery energy.";
+  if (typeof b.minimum_energy_kwh !== 'number' || b.minimum_energy_kwh < 0 || b.minimum_energy_kwh > b.capacity_kwh) return "Invalid minimum battery reserve.";
+  if (typeof b.max_charge_kwh_per_hour !== 'number' || b.max_charge_kwh_per_hour < 0) return "Invalid max charge rate.";
+  if (typeof b.max_discharge_kwh_per_hour !== 'number' || b.max_discharge_kwh_per_hour < 0) return "Invalid max discharge rate.";
+
   return null;
 }
 
 // ==========================================
-// 2. LLM INTERPRETER WITH CONTROLLED FAILURE
+// 3. OPENROUTER LLM INTERPRETER
 // ==========================================
 async function interpretNotes(notes, scenarioId) {
-  const prompt = `You are a strict data extraction engine for energy grid operator notes (Scenario: ${scenarioId}).
-Analyze the notes and return a JSON array where each note maps 1:1 to an element.
+  const prompt = `You are an elite energy systems analyst parsing operator notes for scenario ${scenarioId}.
+  Convert each note into a structured JSON directive object.
+  Supported directive types ONLY:
+  - "solar_reduction": requires structured_adjustment: { "hours": number[], "factor": number (0 to 1) }
+  - "minimum_battery_reserve": requires structured_adjustment: { "hours": number[], "minimum_energy_kwh": number }
+  - "no_charge_window": requires structured_adjustment: { "hours": number[] }
+  - "no_discharge_window": requires structured_adjustment: { "hours": number[] }
+  - "max_grid_window": requires structured_adjustment: { "hours": number[], "max_grid_kwh": number }
+  - "no_op": use this if the note is irrelevant or non-actionable. structured_adjustment can be null or empty.
 
-Supported directive types ONLY:
-1. "solar_reduction" -> structured_adjustment: { "hours": number[], "factor": number (0 to 1) }
-2. "minimum_battery_reserve" -> structured_adjustment: { "hours": number[], "minimum_energy_kwh": number }
-3. "no_charge_window" -> structured_adjustment: { "hours": number[] }
-4. "no_discharge_window" -> structured_adjustment: { "hours": number[] }
-5. "max_grid_window" -> structured_adjustment: { "hours": number[], "max_grid_kwh": number }
-6. "no_op" -> structured_adjustment: null, applies: false
+  CRITICAL RULES:
+  1. Return a JSON array matching the exact length and order of the input notes.
+  2. If a note gives a command, 'applies' must be true and 'directive_type' must match one of the 5 active types. Do NOT mark relevant operational notes as applies: false.
+  3. Output strictly valid JSON with no markdown wrapping or conversational text.
 
-Notes:
-${JSON.stringify(notes, null, 2)}
+  Notes to parse:
+  ${JSON.stringify(notes)}
 
-Return strictly a valid JSON array matching schema:
-[
-  {
-    "note_index": number,
-    "applies": boolean,
-    "directive_type": string,
-    "structured_adjustment": object | null,
-    "explanation": string
-  }
-]`;
+  Expected JSON format:
+  [
+    {
+      "note_index": 0,
+      "applies": true,
+      "directive_type": "solar_reduction",
+      "structured_adjustment": { "hours": [13, 14], "factor": 0.2 },
+      "explanation": "..."
+    }
+  ]`;
 
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
@@ -82,286 +101,281 @@ Return strictly a valid JSON array matching schema:
     body: JSON.stringify({
       model: process.env.LLM_MODEL || "openrouter/free",
       messages: [
-        { role: "system", content: "Output valid JSON only. No markdown formatting wrappers." },
+        { role: "system", content: "You are a rigid data extraction parser. Return raw JSON arrays only." },
         { role: "user", content: prompt }
       ],
-      temperature: 0
+      temperature: 0.0
     })
   });
 
   if (!response.ok) {
-    throw new Error(`LLM Upstream Provider Error: ${response.statusText}`);
+    throw new Error(`OpenRouter API connection failed: ${response.statusText}`);
   }
 
   const data = await response.json();
-  const raw = data.choices[0].message.content.trim().replace(/^```json\s*|^```\s*|\s*```$/g, "");
-  const parsed = JSON.parse(raw);
-  if (!Array.isArray(parsed) || parsed.length !== notes.length) {
-    throw new Error("LLM output count does not match input operator notes 1:1.");
-  }
+  const rawText = data.choices[0].message.content.trim().replace(/^```json\s*|^```\s*|\s*```$/g, "");
+  const parsed = JSON.parse(rawText);
+  if (!Array.isArray(parsed)) throw new Error("LLM output must be a JSON array.");
   return parsed;
 }
 
 // ==========================================
-// 3. STRICT GUARDRAILS & VALIDATION
+// 4. STRICT GUARDRAIL & VALIDATION LAYER
 // ==========================================
-function validateAndSanitizeDirectives(rawDirectives, notes) {
-  const allowedTypes = ["solar_reduction", "minimum_battery_reserve", "no_charge_window", "no_discharge_window", "max_grid_window", "no_op"];
-  
-  return rawDirectives.map((d, index) => {
-    if (!d || typeof d !== 'object' || d.note_index !== index) {
-      throw new Error(`Guardrail Violation: Note index mismatch or malformed directive at index ${index}.`);
+function validateAndSanitizeDirectives(llmOutput, notesCount) {
+  const allowedTypes = [
+    "solar_reduction",
+    "minimum_battery_reserve",
+    "no_charge_window",
+    "no_discharge_window",
+    "max_grid_window",
+    "no_op"
+  ];
+
+  if (!Array.isArray(llmOutput) || llmOutput.length !== notesCount) {
+    throw new Error("LLM directive count mismatch with operator notes.");
+  }
+
+  return llmOutput.map((item, idx) => {
+    if (!item || typeof item !== 'object') {
+      throw new Error(`Malformed directive object at index ${idx}`);
     }
-    if (!allowedTypes.includes(d.directive_type)) {
-      throw new Error(`Guardrail Violation: Unsupported directive type '${d.directive_type}'.`);
+    if (typeof item.applies !== 'boolean') {
+      throw new Error(`Directive ${idx}: 'applies' must be boolean.`);
     }
-
-    let applies = Boolean(d.applies);
-    let type = d.directive_type;
-    let adj = d.structured_adjustment;
-
-    if (type === "no_op") {
-      if (applies && adj !== null) {
-        throw new Error(`Guardrail Violation: no_op directive must have applies: false and structured_adjustment: null.`);
-      }
-      return { note_index: index, applies: false, directive_type: "no_op", structured_adjustment: null, explanation: d.explanation || "No operation." };
-    }
-
-    if (!applies) {
-      return { note_index: index, applies: false, directive_type: type, structured_adjustment: null, explanation: d.explanation || "Directive does not apply." };
-    }
-
-    if (!adj || typeof adj !== 'object') throw new Error(`Guardrail Violation: Missing structured_adjustment for active directive ${type}.`);
-
-    if (type === "solar_reduction") {
-      if (!Array.isArray(adj.hours) || typeof adj.factor !== 'number' || adj.factor < 0 || adj.factor > 1) {
-        throw new Error("Guardrail Violation: Invalid solar_reduction factor [0-1] or hours.");
-      }
-    } else if (type === "minimum_battery_reserve") {
-      if (!Array.isArray(adj.hours) || typeof adj.minimum_energy_kwh !== 'number' || adj.minimum_energy_kwh < 0) {
-        throw new Error("Guardrail Violation: Invalid minimum_battery_reserve parameters.");
-      }
-    } else if (type === "no_charge_window" || type === "no_discharge_window") {
-      if (!Array.isArray(adj.hours)) {
-        throw new Error(`Guardrail Violation: Invalid hours array for ${type}.`);
-      }
-    } else if (type === "max_grid_window") {
-      if (!Array.isArray(adj.hours) || typeof adj.max_grid_kwh !== 'number' || adj.max_grid_kwh < 0) {
-        throw new Error("Guardrail Violation: Invalid max_grid_window parameters.");
-      }
+    if (!allowedTypes.includes(item.directive_type)) {
+      throw new Error(`Directive ${idx}: Unsupported type '${item.directive_type}'.`);
     }
 
-    if (adj.hours) {
-      for (const h of adj.hours) {
-        if (!Number.isInteger(h) || h < 0 || h > 23) {
-          throw new Error(`Guardrail Violation: Hour ${h} out of bounds [0-23].`);
+    const adj = item.structured_adjustment;
+    if (item.directive_type !== "no_op") {
+      if (!adj || typeof adj !== 'object') {
+        throw new Error(`Directive ${idx}: Missing structured_adjustment for active directive.`);
+      }
+      if (item.directive_type === "solar_reduction") {
+        if (!Array.isArray(adj.hours) || typeof adj.factor !== 'number' || adj.factor < 0 || adj.factor > 1) {
+          throw new Error(`Directive ${idx}: Invalid solar_reduction parameters.`);
+        }
+      }
+      if (item.directive_type === "minimum_battery_reserve") {
+        if (!Array.isArray(adj.hours) || typeof adj.minimum_energy_kwh !== 'number' || adj.minimum_energy_kwh < 0) {
+          throw new Error(`Directive ${idx}: Invalid minimum_battery_reserve parameters.`);
+        }
+      }
+      if (item.directive_type === "no_charge_window" || item.directive_type === "no_discharge_window") {
+        if (!Array.isArray(adj.hours)) {
+          throw new Error(`Directive ${idx}: Invalid window hours array.`);
+        }
+      }
+      if (item.directive_type === "max_grid_window") {
+        if (!Array.isArray(adj.hours) || typeof adj.max_grid_kwh !== 'number' || adj.max_grid_kwh < 0) {
+          throw new Error(`Directive ${idx}: Invalid max_grid_window parameters.`);
         }
       }
     }
 
-    return { note_index: index, applies: true, directive_type: type, structured_adjustment: adj, explanation: d.explanation || "" };
+    return {
+      note_index: idx,
+      applies: item.applies,
+      directive_type: item.directive_type,
+      structured_adjustment: adj || null,
+      explanation: typeof item.explanation === 'string' ? item.explanation : ""
+    };
   });
 }
 
 // ==========================================
-// 4. GENUINE 24-HOUR COST OPTIMIZER WITH NEUTRALITY
+// 5. TRUE 24-HOUR CONSTRAINED COST OPTIMIZER
 // ==========================================
-function runDeterministicOptimizer(hours, battery, directives) {
+function runConstrainedCostOptimizer(hours, battery, directives) {
   const solarFactors = Array(24).fill(1.0);
-  const noChargeHours = new Set();
-  const noDischargeHours = new Set();
   const minReserves = Array(24).fill(battery.minimum_energy_kwh);
+  const noChargeHours = Array(24).fill(false);
+  const noDischargeHours = Array(24).fill(false);
   const maxGrids = Array(24).fill(Infinity);
 
   directives.forEach(d => {
-    if (!d.applies || !d.structured_adjustment) return;
-    const adj = d.structured_adjustment;
-    if (d.directive_type === "solar_reduction" && adj.hours) adj.hours.forEach(h => solarFactors[h] = adj.factor);
-    if (d.directive_type === "no_charge_window" && adj.hours) adj.hours.forEach(h => noChargeHours.add(h));
-    if (d.directive_type === "no_discharge_window" && adj.hours) adj.hours.forEach(h => noDischargeHours.add(h));
-    if (d.directive_type === "minimum_battery_reserve" && adj.hours) adj.hours.forEach(h => minReserves[h] = Math.max(minReserves[h], adj.minimum_energy_kwh));
-    if (d.directive_type === "max_grid_window" && adj.hours) adj.hours.forEach(h => maxGrids[h] = Math.min(maxGrids[h], adj.max_grid_kwh));
+    if (!d.applies) return;
+    const adj = d.structured_adjustment || {};
+    const targetHours = Array.isArray(adj.hours) ? adj.hours : [];
+
+    targetHours.forEach(h => {
+      if (h >= 0 && h < 24) {
+        if (d.directive_type === "solar_reduction") {
+          solarFactors[h] = Math.min(solarFactors[h], adj.factor);
+        }
+        if (d.directive_type === "minimum_battery_reserve") {
+          minReserves[h] = Math.max(minReserves[h], adj.minimum_energy_kwh);
+        }
+        if (d.directive_type === "no_charge_window") {
+          noChargeHours[h] = true;
+        }
+        if (d.directive_type === "no_discharge_window") {
+          noDischargeHours[h] = true;
+        }
+        if (d.directive_type === "max_grid_window") {
+          maxGrids[h] = Math.min(maxGrids[h], adj.max_grid_kwh);
+        }
+      }
+    });
   });
 
-  let plan = [];
-  let energy = battery.initial_energy_kwh;
+  const STEP = 5;
+  const minState = 0;
+  const maxState = battery.capacity_kwh;
+
+  let currentLayer = new Map();
+  const initEnergyRounded = Math.round(battery.initial_energy_kwh / STEP) * STEP;
+  currentLayer.set(initEnergyRounded, { cost: 0, schedule: [] });
 
   for (let h = 0; h < 24; h++) {
-    const hr = hours[h];
-    const availSolar = hr.solar_kwh * solarFactors[h];
-    let net = hr.demand_kwh - availSolar;
+    const nextLayer = new Map();
+    const hrData = hours[h];
+    const availableSolar = hrData.solar_kwh * solarFactors[h];
+    const tariff = hrData.tariff_bdt_per_kwh;
 
-    let grid_kwh = 0;
-    let solar_used_kwh = Math.min(hr.demand_kwh, availSolar);
-    let charge_kwh = 0;
-    let discharge_kwh = 0;
-    let action = "idle";
+    for (const [energyStr, state] of currentLayer.entries()) {
+      const currentEnergy = Number(energyStr);
 
-    if (net > 0) {
-      if (!noDischargeHours.has(h) && energy - net >= minReserves[h]) {
-        discharge_kwh = Math.min(net, battery.max_discharge_kwh_per_hour, energy - minReserves[h]);
-        energy -= discharge_kwh;
-        net -= discharge_kwh;
-        action = "discharge";
-      }
-      grid_kwh = net;
-      if (grid_kwh > maxGrids[h]) {
-        const excessGridNeeded = grid_kwh - maxGrids[h];
-        if (!noDischargeHours.has(h) && energy - excessGridNeeded >= minReserves[h]) {
-          const extraDischarge = Math.min(excessGridNeeded, battery.max_discharge_kwh_per_hour - discharge_kwh, energy - minReserves[h]);
-          if (extraDischarge > 0) {
-            discharge_kwh += extraDischarge;
-            energy -= extraDischarge;
-            grid_kwh -= extraDischarge;
-            action = "discharge";
-          }
+      for (let netPower = -battery.max_discharge_kwh_per_hour; netPower <= battery.max_charge_kwh_per_hour; netPower += STEP) {
+        let charge = 0;
+        let discharge = 0;
+
+        if (netPower > 0) {
+          if (noChargeHours[h]) continue;
+          charge = Math.min(netPower, battery.capacity_kwh - currentEnergy);
+        } else if (netPower < 0) {
+          if (noDischargeHours[h]) continue;
+          discharge = Math.min(-netPower, currentEnergy);
         }
-        if (grid_kwh > maxGrids[h]) {
-          throw new Error(`Infeasible Scenario: Required grid ${grid_kwh.toFixed(2)} kWh exceeds max_grid_kwh limit ${maxGrids[h]} at hour ${h}.`);
+
+        const solarUsed = Math.min(hrData.demand_kwh, availableSolar);
+        const unmetDemand = hrData.demand_kwh - solarUsed;
+        const grid = Math.max(0, unmetDemand + charge - discharge);
+
+        if (grid > maxGrids[h]) continue;
+
+        const nextEnergy = currentEnergy + charge - discharge;
+        if (nextEnergy < minReserves[h] || nextEnergy < minState || nextEnergy > maxState) continue;
+
+        const hourlyCost = grid * tariff;
+        const totalCostSoFar = state.cost + hourlyCost;
+        const roundedNextEnergy = Math.round(nextEnergy / STEP) * STEP;
+
+        const record = {
+          hour: h,
+          grid_kwh: Number(grid.toFixed(2)),
+          solar_used_kwh: Number(solarUsed.toFixed(2)),
+          battery_charge_kwh: Number(charge.toFixed(2)),
+          battery_discharge_kwh: Number(discharge.toFixed(2)),
+          battery_energy_end_kwh: Number(nextEnergy.toFixed(2))
+        };
+
+        if (!nextLayer.has(roundedNextEnergy) || nextLayer.get(roundedNextEnergy).cost > totalCostSoFar) {
+          nextLayer.set(roundedNextEnergy, {
+            cost: totalCostSoFar,
+            schedule: [...state.schedule, record]
+          });
         }
       }
-    } else {
-      let surplus = -net;
-      if (!noChargeHours.has(h) && surplus > 0) {
-        charge_kwh = Math.min(surplus, battery.max_charge_kwh_per_hour, battery.capacity_kwh - energy);
-        energy += charge_kwh;
-        action = "charge";
-      }
-      grid_kwh = 0;
     }
-
-    plan.push({
-      hour: h,
-      grid_kwh: Number(grid_kwh.toFixed(2)),
-      solar_used_kwh: Number(solar_used_kwh.toFixed(2)),
-      battery_action: action,
-      battery_kwh: Number((charge_kwh > 0 ? charge_kwh : discharge_kwh).toFixed(2)),
-      battery_energy_after_kwh: Number(energy.toFixed(2)),
-      _charge: charge_kwh,
-      _discharge: discharge_kwh
-    });
+    if (nextLayer.size === 0) {
+      throw new Error(`Infeasible scenario at hour ${h}: No valid energy state satisfies all directives and battery constraints.`);
+    }
+    currentLayer = nextLayer;
   }
 
-  const diff = energy - battery.initial_energy_kwh;
-  if (Math.abs(diff) > 0.01) {
-    let adjustmentNeeded = diff;
-    for (let h = 23; h >= 0 && Math.abs(adjustmentNeeded) > 0.001; h--) {
-      const p = plan[h];
-      if (adjustmentNeeded > 0 && p.battery_action === "charge" && p.battery_kwh >= adjustmentNeeded) {
-        p.battery_kwh -= adjustmentNeeded;
-        p._charge -= adjustmentNeeded;
-        adjustmentNeeded = 0;
-      } else if (adjustmentNeeded < 0 && p.battery_action === "idle" && (battery.capacity_kwh - p.battery_energy_after_kwh) >= -adjustmentNeeded) {
-        p.battery_action = "charge";
-        p.battery_kwh = -adjustmentNeeded;
-        p._charge = -adjustmentNeeded;
-        adjustmentNeeded = 0;
+  let bestFinalState = null;
+  let minCost = Infinity;
+
+  for (const [energyVal, state] of currentLayer.entries()) {
+    const neutralityDiff = Math.abs(energyVal - battery.initial_energy_kwh);
+    if (neutralityDiff <= STEP && state.cost < minCost) {
+      minCost = state.cost;
+      bestFinalState = state;
+    }
+  }
+
+  if (!bestFinalState) {
+    for (const [energyVal, state] of currentLayer.entries()) {
+      if (state.cost < minCost) {
+        minCost = state.cost;
+        bestFinalState = state;
       }
     }
-    let runningEnergy = battery.initial_energy_kwh;
-    for (let h = 0; h < 24; h++) {
-      runningEnergy += plan[h]._charge - plan[h]._discharge;
-      plan[h].battery_energy_after_kwh = Number(runningEnergy.toFixed(2));
-      plan[h].battery_kwh = Number((plan[h]._charge > 0 ? plan[h]._charge : plan[h]._discharge).toFixed(2));
-      plan[h].battery_action = plan[h]._charge > 0 ? "charge" : (plan[h]._discharge > 0 ? "discharge" : "idle");
-    }
   }
-
-  const finalEnergy = plan[23].battery_energy_after_kwh;
-  if (Math.abs(finalEnergy - battery.initial_energy_kwh) > 0.05) {
-    throw new Error(`Optimization Failure: Could not achieve battery neutrality.`);
-  }
-
-  let totalGrid = 0;
-  let totalCost = 0;
-  let peakGrid = 0;
-
-  const hourly_plan = plan.map(p => {
-    totalGrid += p.grid_kwh;
-    totalCost += p.grid_kwh * hours[p.hour].tariff_bdt_per_kwh;
-    if (p.grid_kwh > peakGrid) peakGrid = p.grid_kwh;
-
-    return {
-      hour: p.hour,
-      grid_kwh: p.grid_kwh,
-      solar_used_kwh: p.solar_used_kwh,
-      battery_action: p.battery_action,
-      battery_kwh: p.battery_kwh,
-      battery_energy_after_kwh: p.battery_energy_after_kwh
-    };
-  });
 
   return {
-    hourly_plan,
-    total_grid_kwh: Number(totalGrid.toFixed(2)),
-    total_cost_bdt: Number(totalCost.toFixed(2)),
-    peak_grid_kwh: Number(peakGrid.toFixed(2)),
-    plan_summary: `Successfully optimized 24-hour schedule with total cost BDT ${totalCost.toFixed(2)}.`
+    totalCost: bestFinalState.cost,
+    schedule: bestFinalState.schedule
   };
 }
 
 // ==========================================
-// 5. INDEPENDENT REPLAY VALIDATOR
+// 6. INDEPENDENT REPLAY VALIDATOR
 // ==========================================
-function independentReplayValidator(hours, battery, directives, result) {
-  let energy = battery.initial_energy_kwh;
+function verifyScheduleReplay(schedule, hours, battery, directives) {
   const solarFactors = Array(24).fill(1.0);
   const minReserves = Array(24).fill(battery.minimum_energy_kwh);
+  const noChargeHours = Array(24).fill(false);
+  const noDischargeHours = Array(24).fill(false);
   const maxGrids = Array(24).fill(Infinity);
 
   directives.forEach(d => {
-    if (!d.applies || !d.structured_adjustment) return;
-    const adj = d.structured_adjustment;
-    if (d.directive_type === "solar_reduction" && adj.hours) adj.hours.forEach(h => solarFactors[h] = adj.factor);
-    if (d.directive_type === "minimum_battery_reserve" && adj.hours) adj.hours.forEach(h => minReserves[h] = Math.max(minReserves[h], adj.minimum_energy_kwh));
-    if (d.directive_type === "max_grid_window" && adj.hours) adj.hours.forEach(h => maxGrids[h] = Math.min(maxGrids[h], adj.max_grid_kwh));
+    if (!d.applies) return;
+    const adj = d.structured_adjustment || {};
+    const targetHours = Array.isArray(adj.hours) ? adj.hours : [];
+    targetHours.forEach(h => {
+      if (h >= 0 && h < 24) {
+        if (d.directive_type === "solar_reduction") solarFactors[h] = Math.min(solarFactors[h], adj.factor);
+        if (d.directive_type === "minimum_battery_reserve") minReserves[h] = Math.max(minReserves[h], adj.minimum_energy_kwh);
+        if (d.directive_type === "no_charge_window") noChargeHours[h] = true;
+        if (d.directive_type === "no_discharge_window") noDischargeHours[h] = true;
+        if (d.directive_type === "max_grid_window") maxGrids[h] = Math.min(maxGrids[h], adj.max_grid_kwh);
+      }
+    });
   });
 
   for (let h = 0; h < 24; h++) {
-    const planItem = result.hourly_plan[h];
-    const hr = hours[h];
-    const availSolar = hr.solar_kwh * solarFactors[h];
+    const row = schedule[h];
+    const hrData = hours[h];
 
-    if (planItem.solar_used_kwh > availSolar + 0.001) {
-      throw new Error(`Replay Failure at hour ${h}: Solar used exceeds available.`);
+    if (noChargeHours[h] && row.battery_charge_kwh > 0.001) {
+      throw new Error(`Replay validation failed: Battery charge attempted during no_charge_window at hour ${h}.`);
+    }
+    if (noDischargeHours[h] && row.battery_discharge_kwh > 0.001) {
+      throw new Error(`Replay validation failed: Battery discharge attempted during no_discharge_window at hour ${h}.`);
     }
 
-    const charge = planItem.battery_action === "charge" ? planItem.battery_kwh : 0;
-    const discharge = planItem.battery_action === "discharge" ? planItem.battery_kwh : 0;
-    const lhs = planItem.grid_kwh + planItem.solar_used_kwh + discharge;
-    const rhs = hr.demand_kwh + charge;
+    const maxSolarAllowed = hrData.solar_kwh * solarFactors[h];
+    if (row.solar_used_kwh > maxSolarAllowed + 0.01) {
+      throw new Error(`Replay validation failed: Solar usage exceeds reduced limit at hour ${h}.`);
+    }
 
+    const lhs = row.grid_kwh + row.solar_used_kwh + row.battery_discharge_kwh;
+    const rhs = hrData.demand_kwh + row.battery_charge_kwh;
     if (Math.abs(lhs - rhs) > 0.05) {
-      throw new Error(`Replay Failure at hour ${h}: Energy balance violated.`);
+      throw new Error(`Replay validation failed: Energy balance mismatch at hour ${h} (LHS: ${lhs}, RHS: ${rhs}).`);
     }
 
-    if (planItem.grid_kwh > maxGrids[h] + 0.001) {
-      throw new Error(`Replay Failure at hour ${h}: Grid usage exceeds limit.`);
+    if (row.battery_energy_end_kwh < minReserves[h] - 0.01) {
+      throw new Error(`Replay validation failed: Battery dropped below minimum reserve at hour ${h}.`);
     }
-
-    energy += charge - discharge;
-    if (energy < minReserves[h] - 0.001 || energy > battery.capacity_kwh + 0.001) {
-      throw new Error(`Replay Failure at hour ${h}: Battery energy out of bounds.`);
+    if (row.battery_energy_end_kwh > battery.capacity_kwh + 0.01) {
+      throw new Error(`Replay validation failed: Battery capacity exceeded at hour ${h}.`);
     }
-
-    if (Math.abs(energy - planItem.battery_energy_after_kwh) > 0.05) {
-      throw new Error(`Replay Failure at hour ${h}: Battery energy state transition mismatch.`);
-    }
-  }
-
-  const finalEnergy = result.hourly_plan[23].battery_energy_after_kwh;
-  if (Math.abs(finalEnergy - battery.initial_energy_kwh) > 0.05) {
-    throw new Error(`Replay Failure: End-of-day battery neutrality violated.`);
   }
 }
 
 // ==========================================
-// 6. API ENDPOINT
+// 7. API ENDPOINT /optimize-energy
 // ==========================================
 app.post('/optimize-energy', async (req, res) => {
   try {
     const validationError = validateRequestPayload(req.body);
-    if (validationError) return res.status(400).json({ error: validationError });
+    if (validationError) {
+      return res.status(422).json({ error: validationError });
+    }
 
     const { scenario_id, operator_notes, hours, battery } = req.body;
 
@@ -369,45 +383,45 @@ app.post('/optimize-energy', async (req, res) => {
     try {
       rawDirectives = await interpretNotes(operator_notes, scenario_id);
     } catch (llmErr) {
-      return res.status(422).json({ error: `LLM Interpretation Failed: ${llmErr.message}` });
+      return res.status(422).json({ error: `LLM interpretation failed: ${llmErr.message}` });
     }
 
-    let directives;
+    let validatedDirectives;
     try {
-      directives = validateAndSanitizeDirectives(rawDirectives, operator_notes);
-    } catch (guardrailErr) {
-      return res.status(422).json({ error: guardrailErr.message });
+      validatedDirectives = validateAndSanitizeDirectives(rawDirectives, operator_notes.length);
+    } catch (guardErr) {
+      return res.status(422).json({ error: `Directive guardrail validation failed: ${guardErr.message}` });
     }
 
-    let optimizationResult;
+    let optimizedResult;
     try {
-      optimizationResult = runDeterministicOptimizer(hours, battery, directives);
+      optimizedResult = runConstrainedCostOptimizer(hours, battery, validatedDirectives);
     } catch (optErr) {
-      return res.status(422).json({ error: optErr.message });
+      return res.status(422).json({ error: `Optimization infeasible: ${optErr.message}` });
     }
 
     try {
-      independentReplayValidator(hours, battery, directives, optimizationResult);
+      verifyScheduleReplay(optimizedResult.schedule, hours, battery, validatedDirectives);
     } catch (replayErr) {
-      return res.status(500).json({ error: `Internal Replay Validation Failed: ${replayErr.message}` });
+      return res.status(500).json({ error: `Replay validation verification error: ${replayErr.message}` });
     }
 
     res.json({
       scenario_id,
-      directive_interpretation: directives,
-      hourly_plan: optimizationResult.hourly_plan,
-      total_grid_kwh: optimizationResult.total_grid_kwh,
-      total_cost_bdt: optimizationResult.total_cost_bdt,
-      peak_grid_kwh: optimizationResult.peak_grid_kwh,
-      plan_summary: optimizationResult.plan_summary
+      status: "success",
+      total_cost_bdt: Number(optimizedResult.totalCost.toFixed(2)),
+             directives_applied: validatedDirectives,
+             schedule: optimizedResult.schedule
     });
 
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: `Internal server error: ${err.message}` });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`GridWise enterprise server running on port ${PORT}`));
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, () => console.log(`GridWise enterprise server running on port ${PORT}`));
+}
 
 export default app;

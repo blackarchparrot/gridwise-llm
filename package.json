@@ -1,7 +1,7 @@
 {
   "name": "gridwise-llm",
-  "version": "1.0.0",
-  "description": "BUP CSE Fest 2026 GridWise-LLM Challenge Solution",
+  "version": "2.0.0",
+  "description": "Enterprise Grade GridWise LLM Energy Optimizer",
   "main": "server.js",
   "type": "module",
   "scripts": {
